@@ -2,7 +2,7 @@ import logging
 import os
 import pathlib
 import warnings
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import metatensor.torch
 import numpy as np
@@ -70,6 +70,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         non_conservative=False,
         do_gradients_with_energy=True,
         uncertainty_threshold=0.1,
+        head=None,
     ):
         """
         :param model: model to use for the calculation. This can be a file path, a
@@ -106,6 +107,9 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             (https://pubs.acs.org/doi/full/10.1021/acs.jctc.3c00704). Set this to
             ``None`` to disable uncertainty quantification even if the model supports
             it.
+        :param head: Optional alternative output name to use in place of the reserved
+            ASE keyword "energy". When provided, all energy/force/stress computations
+            are performed with respect to this output head (e.g., "my_energy").
         """
         super().__init__()
 
@@ -116,6 +120,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             "do_gradients_with_energy": bool(do_gradients_with_energy),
             "additional_outputs": additional_outputs,
             "uncertainty_threshold": uncertainty_threshold,
+            "head": head,
         }
 
         # Load the model
@@ -196,6 +201,11 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         self._device = device
         self._model = model.to(device=self._device)
 
+        # Set the energy key to use for all ASE energy/gradient/stress requests.
+        # If head is None, default to "energy". Validate later against capabilities
+        # when building outputs for a given call.
+        self._energy_key: str = head if head is not None else "energy"
+
         self._calculate_uncertainty = (
             "energy_uncertainty" in self._model.capabilities().outputs
             # we require per-atom uncertainties to capture local effects
@@ -221,6 +231,8 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         constructor; and the values will be the corresponding raw
         :py:class:`metatensor.torch.TensorMap` produced by the model.
         """
+        # Initialize results holder to satisfy linters and ASE expectations
+        self.results: Dict[str, Any] = {}
 
     def todict(self):
         if "model" not in self.parameters:
@@ -422,31 +434,31 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
                 system.add_neighbor_list(options, neighbors)
 
         # no `record_function` here, this will be handled by AtomisticModel
-        outputs = self._model(
+        predictions = self._model(
             [system],
             run_options,
             check_consistency=self.parameters["check_consistency"],
         )
-        energy = outputs["energy"]
+        energy_tm = predictions[self._energy_key]
 
         with record_function("MetatomicCalculator::sum_energies"):
-            if run_options.outputs["energy"].per_atom:
-                assert len(energy) == 1
-                assert energy.sample_names == ["system", "atom"]
-                assert torch.all(energy.block().samples["system"] == 0)
-                energies = energy
+            if run_options.outputs[self._energy_key].per_atom:
+                assert len(energy_tm) == 1
+                assert energy_tm.sample_names == ["system", "atom"]
+                assert torch.all(energy_tm.block().samples["system"] == 0)
+                energies = energy_tm
                 assert energies.block().values.shape == (len(atoms), 1)
 
-                energy = metatensor.torch.sum_over_samples(
-                    energy, sample_names=["atom"]
+                energy_tm = metatensor.torch.sum_over_samples(
+                    energy_tm, sample_names=["atom"]
                 )
 
-            assert len(energy.block().gradients_list()) == 0
-            assert energy.block().values.shape == (1, 1)
+            assert len(energy_tm.block().gradients_list()) == 0
+            assert energy_tm.block().values.shape == (1, 1)
 
         with record_function("ASECalculator::uncertainty_warning"):
             if calculate_energy and self._calculate_uncertainty:
-                uncertainty = outputs["energy_uncertainty"].block().values
+                uncertainty = predictions["energy_uncertainty"].block().values
                 assert uncertainty.shape == (len(atoms), 1)
                 uncertainty = uncertainty.detach().cpu().numpy()
 
@@ -456,12 +468,12 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
                         "Some of the atomic energy uncertainties are larger than"
                         f"the threshold of {threshold} eV."
                         "The prediction is above the threshold for atoms"
-                        f" {np.where(uncertainty > threshold)[0]}.",
+                        f" {np.where(uncertainty > threshold)[0]}",
                         stacklevel=2,
                     )
 
         if do_backward:
-            if energy.block().values.grad_fn is None:
+            if energy_tm.block().values.grad_fn is None:
                 # did the user actually request a gradient, or are we trying to
                 # compute one just for efficiency?
                 if "forces" in properties or "stress" in properties:
@@ -475,7 +487,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
 
         with record_function("MetatomicCalculator::run_backward"):
             if do_backward:
-                energy.block().values.backward()
+                energy_tm.block().values.backward()
 
         with record_function("MetatomicCalculator::convert_outputs"):
             self.results = {}
@@ -492,14 +504,14 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
                 self.results["energies"] = result.numpy()
 
             if calculate_energy:
-                energy_values = energy.block().values.detach()
+                energy_values = energy_tm.block().values.detach()
                 energy_values = energy_values.to(device="cpu").to(dtype=torch.float64)
                 self.results["energy"] = energy_values.numpy()[0, 0]
 
             if calculate_forces:
                 if self.parameters["non_conservative"]:
                     forces_values = (
-                        outputs["non_conservative_forces"].block().values.detach()
+                        predictions["non_conservative_forces"].block().values.detach()
                     )
                     # remove any spurious net force
                     forces_values = forces_values - forces_values.mean(
@@ -514,7 +526,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             if calculate_stress:
                 if self.parameters["non_conservative"]:
                     stress_values = (
-                        outputs["non_conservative_stress"].block().values.detach()
+                        predictions["non_conservative_stress"].block().values.detach()
                     )
                 else:
                     stress_values = strain.grad / atoms.cell.volume
@@ -526,7 +538,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
 
             self.additional_outputs = {}
             for name in self._additional_output_requests:
-                self.additional_outputs[name] = outputs[name]
+                self.additional_outputs[name] = predictions[name]
 
     def compute_energy(
         self,
@@ -566,8 +578,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         )
 
         systems = []
-        if compute_forces_and_stresses:
-            strains = []
+        strains = []
         for atoms in atoms_list:
             types, positions, cell, pbc = _ase_to_torch_data(
                 atoms=atoms, dtype=self._dtype, device=self._device
@@ -604,7 +615,7 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
             options=options,
             check_consistency=self.parameters["check_consistency"],
         )
-        energies = predictions["energy"]
+        energies = predictions[self._energy_key]
 
         results_as_numpy_arrays = {
             "energy": energies.block().values.detach().cpu().numpy().flatten().tolist()
@@ -688,7 +699,10 @@ class MetatomicCalculator(ase.calculators.calculator.Calculator):
         else:
             output.per_atom = False
 
-        metatensor_outputs = {"energy": output}
+        # Use the selected energy head key
+        energy_key = self._energy_key
+
+        metatensor_outputs = {energy_key: output}
         if calculate_forces and self.parameters["non_conservative"]:
             metatensor_outputs["non_conservative_forces"] = ModelOutput(
                 quantity="force",
